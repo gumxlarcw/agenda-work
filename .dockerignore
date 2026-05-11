@@ -1,0 +1,35 @@
+# M6: Docker ignore file - exclude sensitive and unnecessary files
+.env
+.env.*
+*.backup
+
+# Dependencies (rebuilt in container)
+node_modules
+frontend/node_modules
+backend/node_modules
+
+# Git
+.git
+.gitignore
+
+# Python virtual environment
+automasi/venv
+automasi/__pycache__
+
+# Logs
+logs/
+*.log
+
+# IDE / OS
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Credentials and secrets
+*.pem
+*.key
+credentials*.json
+
+# Build artifacts
+frontend/dist

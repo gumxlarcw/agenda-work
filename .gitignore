@@ -1,0 +1,28 @@
+node_modules/
+.env
+.env.local
+.env.*.local
+logs/
+dist/
+build/
+*.log
+.DS_Store
+
+# #49: backup-before-edit workflow artefacts — useful locally, noise in VCS.
+*.backup
+*.backup*
+*.broken
+
+# Uploaded user content — never commit binary uploads.
+backend/uploads/
+
+# Claude Code workspace (1.6 GB, contains worktrees of UNRELATED projects with their own .env files).
+.claude/
+
+# Local OCR utility — currently has hardcoded API key in surat.py. Sanitize and re-add when ready.
+automasi/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp

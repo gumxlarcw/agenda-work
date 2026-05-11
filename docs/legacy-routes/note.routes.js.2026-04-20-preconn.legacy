@@ -1,0 +1,703 @@
+const express = require('express');
+const axios = require('axios');
+const { body, validationResult } = require('express-validator');
+const pool = require('../config/database');
+const { verifyToken, addUserFilter } = require('../middleware/auth.middleware');
+
+const router = express.Router();
+
+// Helper: extract plain text from TipTap/ProseMirror JSON
+function extractPlainText(json) {
+    if (!json) return '';
+    const walk = (node) => {
+        if (node.text) return node.text;
+        if (node.content) return node.content.map(walk).join('\n');
+        return '';
+    };
+    return walk(json).trim();
+}
+
+// B3: Safe JSON parse helper
+function safeParseJson(input) {
+    if (!input) return null;
+    if (typeof input !== 'string') return input;
+    try {
+        return JSON.parse(input);
+    } catch (e) {
+        return null;
+    }
+}
+
+// B5: Validate tag_ids belong to user
+async function validateTagOwnership(tagIds, userId) {
+    if (!tagIds || tagIds.length === 0) return [];
+    const intIds = tagIds.map(id => parseInt(id, 10)).filter(id => !isNaN(id) && id > 0);
+    if (intIds.length === 0) return [];
+    const [ownedTags] = await pool.query(
+        'SELECT id FROM note_tags WHERE id IN (?) AND user_id = ?',
+        [intIds, userId]
+    );
+    return ownedTags.map(t => t.id);
+}
+
+// B7: Strip FULLTEXT boolean mode special characters from user input
+function sanitizeSearchTerm(term) {
+    // Remove all boolean mode operators to prevent parse errors
+    return term.replace(/[+\-<>~*"@()]/g, '').trim();
+}
+
+// GET /api/notes/recent — dashboard preview
+router.get('/recent', verifyToken, addUserFilter, async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit) || 3, 10);
+        const userFilter = req.userFilter;
+        const userClause = userFilter ? 'AND n.user_id = ?' : '';
+        const userParam = userFilter ? [userFilter.user_id] : [];
+
+        const [notes] = await pool.query(
+            `SELECT n.id, n.title, SUBSTRING(n.content, 1, 100) as plain_text_preview,
+             n.updated_at, n.color, nf.name as folder_name
+             FROM notes n
+             LEFT JOIN note_folders nf ON n.folder_id = nf.id
+             WHERE n.is_archived = 0 ${userClause}
+             ORDER BY n.updated_at DESC
+             LIMIT ?`,
+            [...userParam, limit]
+        );
+
+        res.json({ success: true, data: notes });
+    } catch (error) {
+        console.error('Recent notes error:', error);
+        res.status(500).json({ success: false, message: 'Failed to fetch recent notes' });
+    }
+});
+
+// Get all notes (with pagination + date filter + search + folder + tag + archive + shared)
+router.get('/', verifyToken, addUserFilter, async (req, res) => {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = Math.min(parseInt(req.query.limit) || 10, 100);
+        const offset = (page - 1) * limit;
+        const { date_from, date_to, search, folder_id, tag_id, is_archived, shared_with_me } = req.query;
+
+        const isAdminView = req.user.role === 'admin' && !req.userFilter;
+        const prefix = isAdminView ? 'n.' : '';
+
+        const needTagJoin = !!tag_id;
+
+        let query_sql = isAdminView
+            ? 'SELECT n.*, u.username FROM notes n JOIN users u ON n.user_id = u.id'
+            : 'SELECT n.* FROM notes n';
+        let count_sql = isAdminView
+            ? 'SELECT COUNT(*) as total FROM notes n JOIN users u ON n.user_id = u.id'
+            : 'SELECT COUNT(*) as total FROM notes n';
+
+        if (needTagJoin) {
+            const tagJoin = ' JOIN note_tag_map ntm ON n.id = ntm.note_id';
+            query_sql += tagJoin;
+            count_sql += tagJoin;
+        }
+
+        const params = [];
+        const countParams = [];
+        const conditions = [];
+
+        if (shared_with_me === '1' || shared_with_me === 'true') {
+            conditions.push(`JSON_CONTAINS(${prefix}shared_with, ?)`);
+            params.push(req.user.id);
+            countParams.push(req.user.id);
+        } else {
+            if (req.userFilter) {
+                conditions.push(`${prefix}user_id = ?`);
+                params.push(req.userFilter.user_id);
+                countParams.push(req.userFilter.user_id);
+            }
+        }
+
+        if (is_archived === '1' || is_archived === 'true') {
+            conditions.push(`${prefix}is_archived = 1`);
+        } else {
+            conditions.push(`${prefix}is_archived = 0`);
+        }
+
+        const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+        if (date_from) {
+            if (!dateRegex.test(date_from)) {
+                return res.status(400).json({ success: false, message: 'Invalid date_from format (YYYY-MM-DD)' });
+            }
+            conditions.push(`${prefix}created_at >= ?`);
+            params.push(date_from + ' 00:00:00');
+            countParams.push(date_from + ' 00:00:00');
+        }
+
+        if (date_to) {
+            if (!dateRegex.test(date_to)) {
+                return res.status(400).json({ success: false, message: 'Invalid date_to format (YYYY-MM-DD)' });
+            }
+            conditions.push(`${prefix}created_at <= ?`);
+            params.push(date_to + ' 23:59:59');
+            countParams.push(date_to + ' 23:59:59');
+        }
+
+        // B7: Sanitize FULLTEXT search input
+        if (search && search.trim()) {
+            const cleaned = sanitizeSearchTerm(search);
+            if (cleaned.length > 0) {
+                const searchTerm = cleaned + '*';
+                conditions.push(`MATCH(${prefix}title, ${prefix}content) AGAINST(? IN BOOLEAN MODE)`);
+                params.push(searchTerm);
+                countParams.push(searchTerm);
+            }
+        }
+
+        if (folder_id) {
+            conditions.push(`${prefix}folder_id = ?`);
+            params.push(parseInt(folder_id));
+            countParams.push(parseInt(folder_id));
+        }
+
+        if (tag_id) {
+            conditions.push(`ntm.tag_id = ?`);
+            params.push(parseInt(tag_id));
+            countParams.push(parseInt(tag_id));
+        }
+
+        if (conditions.length > 0) {
+            const where = ' WHERE ' + conditions.join(' AND ');
+            query_sql += where;
+            count_sql += where;
+        }
+
+        query_sql += ` ORDER BY ${prefix}is_pinned DESC, ${prefix}sort_order ASC, ${prefix}updated_at DESC LIMIT ? OFFSET ?`;
+        params.push(limit, offset);
+
+        const [[{ total }]] = await pool.query(count_sql, countParams);
+        const [notes] = await pool.query(query_sql, params);
+
+        res.json({
+            success: true,
+            data: notes,
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages: Math.ceil(total / limit)
+            }
+        });
+    } catch (error) {
+        console.error('Get notes error:', error);
+        res.status(500).json({ success: false, message: 'Failed to fetch notes' });
+    }
+});
+
+// Get single note (with tags and attachments)
+router.get('/:id', verifyToken, addUserFilter, async (req, res) => {
+    try {
+        let query_sql = 'SELECT * FROM notes WHERE id = ?';
+        const params = [req.params.id];
+
+        if (req.userFilter) {
+            query_sql += ' AND (user_id = ? OR JSON_CONTAINS(shared_with, ?))';
+            params.push(req.userFilter.user_id, req.user.id);
+        }
+
+        const [notes] = await pool.query(query_sql, params);
+
+        if (notes.length === 0) {
+            return res.status(404).json({ success: false, message: 'Note not found' });
+        }
+
+        const note = notes[0];
+
+        const [tags] = await pool.query(
+            'SELECT t.* FROM note_tags t JOIN note_tag_map m ON t.id = m.tag_id WHERE m.note_id = ?',
+            [note.id]
+        );
+
+        const [attachments] = await pool.query(
+            'SELECT * FROM note_attachments WHERE note_id = ?',
+            [note.id]
+        );
+
+        note.tags = tags;
+        note.attachments = attachments;
+
+        res.json({ success: true, data: note });
+    } catch (error) {
+        console.error('Get note error:', error);
+        res.status(500).json({ success: false, message: 'Failed to fetch note' });
+    }
+});
+
+// Create note
+router.post('/', verifyToken, [
+    body('title').trim().notEmpty().withMessage('Title is required'),
+    body('content').optional().trim(),
+    body('content_json').optional(),
+    body('category').optional().trim(),
+    body('is_pinned').optional().isBoolean(),
+    body('color').optional().matches(/^#[0-9A-Fa-f]{6}$/),
+    body('folder_id').optional({ nullable: true }).isInt(),
+    body('linked_task_id').optional({ nullable: true }).isInt(),
+    body('linked_kegiatan_id').optional({ nullable: true }).isInt(),
+    body('tag_ids').optional().isArray(),
+    body('user_id').optional().isInt({ min: 1 })  // B10: validate admin impersonation field
+], async (req, res) => {
+    try {
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({ success: false, errors: errors.array() });
+        }
+
+        const { title, content, content_json, category, is_pinned, color, folder_id, linked_task_id, linked_kegiatan_id, tag_ids } = req.body;
+        // B10: parseInt for safety
+        const userId = req.user.role === 'admin' && req.body.user_id
+            ? parseInt(req.body.user_id, 10)
+            : req.user.id;
+
+        // B3: Safe JSON parse for content_json
+        let finalContent = content || null;
+        let finalContentJson = null;
+        if (content_json) {
+            const parsed = safeParseJson(content_json);
+            if (!parsed) {
+                return res.status(400).json({ success: false, message: 'Invalid content_json format' });
+            }
+            finalContentJson = typeof content_json === 'string' ? content_json : JSON.stringify(content_json);
+            finalContent = extractPlainText(parsed);
+        }
+
+        // Validate folder_id ownership
+        if (folder_id) {
+            const [folder] = await pool.query('SELECT id FROM note_folders WHERE id = ? AND user_id = ?', [parseInt(folder_id), userId]);
+            if (folder.length === 0) {
+                return res.status(400).json({ success: false, message: 'Invalid folder' });
+            }
+        }
+
+        const [result] = await pool.query(
+            `INSERT INTO notes (user_id, title, content, content_json, category, is_pinned, color, folder_id, linked_task_id, linked_kegiatan_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                userId, title, finalContent, finalContentJson,
+                category || null, is_pinned || false, color || '#ffffff',
+                folder_id ? parseInt(folder_id) : null, linked_task_id ? parseInt(linked_task_id) : null, linked_kegiatan_id ? parseInt(linked_kegiatan_id) : null
+            ]
+        );
+
+        // B5: Validate tag ownership before inserting
+        if (tag_ids && tag_ids.length > 0) {
+            const validTagIds = await validateTagOwnership(tag_ids, userId);
+            if (validTagIds.length > 0) {
+                const tagValues = validTagIds.map(tagId => [result.insertId, tagId]);
+                await pool.query('INSERT INTO note_tag_map (note_id, tag_id) VALUES ?', [tagValues]);
+            }
+        }
+
+        const [newNote] = await pool.query('SELECT * FROM notes WHERE id = ?', [result.insertId]);
+        res.status(201).json({ success: true, message: 'Note created successfully', data: newNote[0] });
+    } catch (error) {
+        console.error('Create note error:', error);
+        res.status(500).json({ success: false, message: 'Failed to create note' });
+    }
+});
+
+// Update note
+router.put('/:id', verifyToken, addUserFilter, [
+    body('title').optional().trim().notEmpty(),
+    body('content').optional().trim(),
+    body('content_json').optional(),
+    body('category').optional().trim(),
+    body('is_pinned').optional().isBoolean(),
+    body('color').optional().matches(/^#[0-9A-Fa-f]{6}$/),
+    body('folder_id').optional({ nullable: true }).isInt({ allow_string: true }),
+    body('linked_task_id').optional({ nullable: true }).isInt({ allow_string: true }),
+    body('linked_kegiatan_id').optional({ nullable: true }).isInt({ allow_string: true }),
+    body('tag_ids').optional().isArray()
+], async (req, res) => {
+    try {
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({ success: false, errors: errors.array() });
+        }
+
+        const noteId = req.params.id;
+
+        let checkQuery = 'SELECT id, user_id FROM notes WHERE id = ?';
+        const checkParams = [noteId];
+        if (req.userFilter) {
+            checkQuery += ' AND user_id = ?';
+            checkParams.push(req.userFilter.user_id);
+        }
+
+        const [existing] = await pool.query(checkQuery, checkParams);
+        if (existing.length === 0) {
+            return res.status(404).json({ success: false, message: 'Note not found' });
+        }
+
+        const noteOwnerId = existing[0].user_id;
+        const allowedFields = ['title', 'content', 'category', 'is_pinned', 'color', 'folder_id', 'linked_task_id', 'linked_kegiatan_id', 'content_json'];
+        const updates = [];
+        const values = [];
+
+        // B3: Safe JSON parse for content_json
+        if (req.body.content_json !== undefined) {
+            const contentJson = req.body.content_json;
+            const parsed = safeParseJson(contentJson);
+            if (!parsed) {
+                return res.status(400).json({ success: false, message: 'Invalid content_json format' });
+            }
+            const jsonStr = typeof contentJson === 'string' ? contentJson : JSON.stringify(contentJson);
+            updates.push('content_json = ?');
+            values.push(jsonStr);
+            updates.push('content = ?');
+            values.push(extractPlainText(parsed));
+        }
+
+        const intFields = new Set(['folder_id', 'linked_task_id', 'linked_kegiatan_id']);
+        for (const field of allowedFields) {
+            if (field === 'content_json') continue;
+            if (field === 'content' && req.body.content_json !== undefined) continue;
+            if (req.body[field] !== undefined) {
+                updates.push(`${field} = ?`);
+                const val = intFields.has(field) ? (req.body[field] ? parseInt(req.body[field], 10) : null) : req.body[field];
+                values.push(val);
+            }
+        }
+
+        // Validate folder_id ownership on update
+        if (req.body.folder_id) {
+            const [folder] = await pool.query('SELECT id FROM note_folders WHERE id = ? AND user_id = ?', [parseInt(req.body.folder_id), noteOwnerId]);
+            if (folder.length === 0) {
+                return res.status(400).json({ success: false, message: 'Invalid folder' });
+            }
+        }
+
+        if (updates.length === 0 && !req.body.tag_ids) {
+            return res.status(400).json({ success: false, message: 'No fields to update' });
+        }
+
+        if (updates.length > 0) {
+            values.push(noteId);
+            await pool.query(`UPDATE notes SET ${updates.join(', ')} WHERE id = ?`, values);
+        }
+
+        // B5: Validate tag ownership before inserting
+        if (req.body.tag_ids !== undefined) {
+            await pool.query('DELETE FROM note_tag_map WHERE note_id = ?', [noteId]);
+            if (req.body.tag_ids.length > 0) {
+                const validTagIds = await validateTagOwnership(req.body.tag_ids, noteOwnerId);
+                if (validTagIds.length > 0) {
+                    const tagValues = validTagIds.map(tagId => [parseInt(noteId), tagId]);
+                    await pool.query('INSERT INTO note_tag_map (note_id, tag_id) VALUES ?', [tagValues]);
+                }
+            }
+        }
+
+        const [updatedNote] = await pool.query('SELECT * FROM notes WHERE id = ?', [noteId]);
+        res.json({ success: true, message: 'Note updated successfully', data: updatedNote[0] });
+    } catch (error) {
+        console.error('Update note error:', error);
+        res.status(500).json({ success: false, message: 'Failed to update note' });
+    }
+});
+
+// Toggle archive
+router.patch('/:id/archive', verifyToken, addUserFilter, async (req, res) => {
+    try {
+        const noteId = req.params.id;
+
+        let checkQuery = 'SELECT id, is_archived FROM notes WHERE id = ?';
+        const checkParams = [noteId];
+        if (req.userFilter) {
+            checkQuery += ' AND user_id = ?';
+            checkParams.push(req.userFilter.user_id);
+        }
+
+        const [existing] = await pool.query(checkQuery, checkParams);
+        if (existing.length === 0) {
+            return res.status(404).json({ success: false, message: 'Note not found' });
+        }
+
+        const newArchived = existing[0].is_archived ? 0 : 1;
+        await pool.query('UPDATE notes SET is_archived = ? WHERE id = ?', [newArchived, noteId]);
+
+        const [updatedNote] = await pool.query('SELECT * FROM notes WHERE id = ?', [noteId]);
+        res.json({
+            success: true,
+            message: newArchived ? 'Note archived' : 'Note unarchived',
+            data: updatedNote[0]
+        });
+    } catch (error) {
+        console.error('Archive note error:', error);
+        res.status(500).json({ success: false, message: 'Failed to toggle archive' });
+    }
+});
+
+// Share note
+router.patch('/:id/share', verifyToken, addUserFilter, async (req, res) => {
+    try {
+        const noteId = req.params.id;
+        const { user_ids } = req.body;
+
+        if (!Array.isArray(user_ids)) {
+            return res.status(400).json({ success: false, message: 'user_ids must be an array' });
+        }
+
+        // B4: Validate user_ids — must be positive integers, max 50, and exist in users table
+        const sanitizedIds = user_ids
+            .map(id => parseInt(id, 10))
+            .filter(id => !isNaN(id) && id > 0);
+
+        if (sanitizedIds.length > 50) {
+            return res.status(400).json({ success: false, message: 'Maximum 50 users can be shared with' });
+        }
+
+        // Verify existing users if any IDs provided
+        let validUserIds = [];
+        if (sanitizedIds.length > 0) {
+            const [existingUsers] = await pool.query('SELECT id FROM users WHERE id IN (?)', [sanitizedIds]);
+            validUserIds = existingUsers.map(u => u.id);
+        }
+
+        // B12: Ownership check with 403 for non-owners
+        let checkQuery = 'SELECT id, user_id FROM notes WHERE id = ?';
+        const checkParams = [noteId];
+        if (req.userFilter) {
+            checkQuery += ' AND user_id = ?';
+            checkParams.push(req.userFilter.user_id);
+        }
+
+        const [existing] = await pool.query(checkQuery, checkParams);
+        if (existing.length === 0) {
+            // Check if note exists at all (for proper 403 vs 404)
+            if (req.userFilter) {
+                const [noteExists] = await pool.query('SELECT id FROM notes WHERE id = ?', [noteId]);
+                if (noteExists.length > 0) {
+                    return res.status(403).json({ success: false, message: 'You can only share your own notes' });
+                }
+            }
+            return res.status(404).json({ success: false, message: 'Note not found' });
+        }
+
+        await pool.query(
+            'UPDATE notes SET shared_with = ? WHERE id = ?',
+            [JSON.stringify(validUserIds), noteId]
+        );
+
+        const [updatedNote] = await pool.query('SELECT * FROM notes WHERE id = ?', [noteId]);
+        res.json({ success: true, message: 'Note sharing updated', data: updatedNote[0] });
+    } catch (error) {
+        console.error('Share note error:', error);
+        res.status(500).json({ success: false, message: 'Failed to update sharing' });
+    }
+});
+
+// AI Summary
+router.post('/:id/summarize', verifyToken, addUserFilter, async (req, res) => {
+    try {
+        const noteId = req.params.id;
+
+        let checkQuery = 'SELECT * FROM notes WHERE id = ?';
+        const checkParams = [noteId];
+        if (req.userFilter) {
+            checkQuery += ' AND user_id = ?';
+            checkParams.push(req.userFilter.user_id);
+        }
+
+        const [notes] = await pool.query(checkQuery, checkParams);
+        if (notes.length === 0) {
+            return res.status(404).json({ success: false, message: 'Note not found' });
+        }
+
+        const note = notes[0];
+
+        // B3: Safe JSON parse for stored content_json
+        let plainText = '';
+        if (note.content_json) {
+            const parsed = safeParseJson(note.content_json);
+            if (parsed) {
+                plainText = extractPlainText(parsed);
+            }
+        }
+        if (!plainText) {
+            plainText = note.content || '';
+        }
+
+        if (!plainText.trim()) {
+            return res.status(400).json({ success: false, message: 'Note has no content to summarize' });
+        }
+
+        // Cap input to 20K chars to prevent excessive token usage
+        if (plainText.length > 20000) {
+            plainText = plainText.substring(0, 20000);
+        }
+
+        const llmResponse = await axios.post('http://localhost:3031/v1/chat/completions', {
+            model: 'claude-sonnet-4-6',
+            messages: [
+                {
+                    role: 'system',
+                    content: 'Rangkum catatan berikut dalam 3-5 poin utama, bahasa Indonesia, format bullet. Jika ada checklist, sebutkan progress (X/Y selesai).'
+                },
+                { role: 'user', content: plainText }
+            ]
+        }, { timeout: 30000 });
+
+        const summary = llmResponse.data.choices[0].message.content;
+        await pool.query('UPDATE notes SET ai_summary = ? WHERE id = ?', [summary, noteId]);
+
+        res.json({ success: true, message: 'Summary generated', data: { ai_summary: summary } });
+    } catch (error) {
+        console.error('Summarize note error:', error);
+        res.status(500).json({ success: false, message: 'Failed to generate summary' });
+    }
+});
+
+// Checklist to Task
+router.post('/:id/checklist-to-task', verifyToken, addUserFilter, [
+    body('text').trim().notEmpty().withMessage('Task text is required'),
+    body('priority').optional().isIn(['P0', 'P1', 'P2', 'P3']),
+    body('end_date').optional().isISO8601().withMessage('Invalid date format')  // B8: validate end_date
+], async (req, res) => {
+    try {
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({ success: false, errors: errors.array() });
+        }
+
+        const noteId = req.params.id;
+        const { text, priority, end_date } = req.body;
+
+        let checkQuery = 'SELECT id FROM notes WHERE id = ?';
+        const checkParams = [noteId];
+        if (req.userFilter) {
+            checkQuery += ' AND user_id = ?';
+            checkParams.push(req.userFilter.user_id);
+        }
+
+        const [existing] = await pool.query(checkQuery, checkParams);
+        if (existing.length === 0) {
+            return res.status(404).json({ success: false, message: 'Note not found' });
+        }
+
+        const taskPriority = priority || 'P2';
+        const [taskResult] = await pool.query(
+            'INSERT INTO tasks (user_id, task, priority, status, end_date) VALUES (?, ?, ?, ?, ?)',
+            [req.user.id, text.trim(), taskPriority, 'pending', end_date || null]
+        );
+
+        await pool.query('UPDATE notes SET linked_task_id = ? WHERE id = ?', [taskResult.insertId, noteId]);
+
+        const [newTask] = await pool.query('SELECT * FROM tasks WHERE id = ?', [taskResult.insertId]);
+        res.status(201).json({ success: true, message: 'Task created from checklist', data: newTask[0] });
+    } catch (error) {
+        console.error('Checklist to task error:', error);
+        res.status(500).json({ success: false, message: 'Failed to create task from checklist' });
+    }
+});
+
+// Delete note
+router.delete('/:id', verifyToken, addUserFilter, async (req, res) => {
+    try {
+        const noteId = req.params.id;
+
+        let deleteQuery = 'DELETE FROM notes WHERE id = ?';
+        const params = [noteId];
+
+        if (req.userFilter) {
+            deleteQuery += ' AND user_id = ?';
+            params.push(req.userFilter.user_id);
+        }
+
+        const [result] = await pool.query(deleteQuery, params);
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ success: false, message: 'Note not found' });
+        }
+
+        res.json({ success: true, message: 'Note deleted successfully' });
+    } catch (error) {
+        console.error('Delete note error:', error);
+        res.status(500).json({ success: false, message: 'Failed to delete note' });
+    }
+});
+
+// Reorder notes (drag-and-drop)
+router.patch('/reorder', verifyToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { orderedIds } = req.body;
+
+        if (!Array.isArray(orderedIds) || orderedIds.length === 0) {
+            return res.status(400).json({ success: false, message: 'orderedIds array is required' });
+        }
+
+        // Sanitize IDs
+        const ids = orderedIds.map(id => parseInt(id, 10)).filter(id => !isNaN(id) && id > 0);
+        if (ids.length === 0) {
+            return res.status(400).json({ success: false, message: 'No valid note IDs provided' });
+        }
+
+        // Verify all notes belong to user
+        const [owned] = await pool.query(
+            'SELECT id FROM notes WHERE id IN (?) AND user_id = ?',
+            [ids, userId]
+        );
+        const ownedIds = new Set(owned.map(n => n.id));
+
+        // Build batch update — CASE/WHEN for performance
+        const cases = [];
+        const caseParams = [];
+        const validIds = [];
+        ids.forEach((id, index) => {
+            if (ownedIds.has(id)) {
+                cases.push('WHEN id = ? THEN ?');
+                caseParams.push(id, index);
+                validIds.push(id);
+            }
+        });
+
+        if (validIds.length === 0) {
+            return res.status(404).json({ success: false, message: 'No matching notes found' });
+        }
+
+        await pool.query(
+            `UPDATE notes SET sort_order = CASE ${cases.join(' ')} END WHERE id IN (?) AND user_id = ?`,
+            [...caseParams, validIds, userId]
+        );
+
+        res.json({ success: true, message: 'Notes reordered' });
+    } catch (error) {
+        console.error('Reorder notes error:', error);
+        res.status(500).json({ success: false, message: 'Failed to reorder notes' });
+    }
+});
+
+// ─── Update note position (free drag) ──────────────────
+router.patch('/:id/position', verifyToken, [
+    body('position_x').optional({ nullable: true }).isFloat({ min: 0 }),
+    body('position_y').optional({ nullable: true }).isFloat({ min: 0 }),
+    body('card_width').optional({ nullable: true }).isInt({ min: 200, max: 800 }),
+], async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ success: false, errors: errors.array() });
+    }
+    try {
+        const { position_x, position_y, card_width } = req.body;
+        const [result] = await pool.query(
+            'UPDATE notes SET position_x = ?, position_y = ?, card_width = ? WHERE id = ? AND user_id = ?',
+            [position_x, position_y, card_width ?? null, req.params.id, req.user.id]
+        );
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ success: false, message: 'Note not found' });
+        }
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Update note position error:', error);
+        res.status(500).json({ success: false, message: 'Failed to update position' });
+    }
+});
+
+module.exports = router;

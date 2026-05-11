@@ -1,0 +1,45 @@
+# Cloudflare Tunnel Configuration for Agenda Work
+# Add these ingress rules to your existing /root/.cloudflared/config.yml
+
+# ============================================
+# INGRESS RULES TO ADD:
+# ============================================
+#
+# Add these entries to your ingress section:
+#
+#   - hostname: agenda.bpsmalut.com
+#     service: http://localhost:5101
+#
+#   - hostname: api-agenda.bpsmalut.com
+#     service: http://localhost:5100
+#
+# ============================================
+
+# Example full config.yml structure:
+# 
+# tunnel: your-tunnel-id
+# credentials-file: /root/.cloudflared/your-credentials.json
+#
+# ingress:
+#   # ... your existing rules ...
+#
+#   # Agenda Work Frontend
+#   - hostname: agenda.bpsmalut.com
+#     service: http://localhost:5101
+#
+#   # Agenda Work API
+#   - hostname: api-agenda.bpsmalut.com
+#     service: http://localhost:5100
+#
+#   # Catch-all (should be last)
+#   - service: http_status:404
+
+# After updating config.yml, restart cloudflared:
+# sudo systemctl restart cloudflared
+# or
+# cloudflared tunnel run <tunnel-name>
+
+# DNS Setup:
+# Make sure you have CNAME records in Cloudflare DNS:
+# - agenda.bpsmalut.com -> your-tunnel-id.cfargotunnel.com
+# - api-agenda.bpsmalut.com -> your-tunnel-id.cfargotunnel.com
