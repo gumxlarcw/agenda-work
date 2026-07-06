@@ -10,8 +10,8 @@ function makeSession(id, judul, nSegs, segLen) {
   }
   return { session: { id, judul, tanggal: '2026-07-01' }, segments };
 }
-// 4 sesi × ±30rb karakter → dengan maxChars default 50000 hasilnya multi-batch (±3 batch)
-const sessions = [1, 2, 3, 4].map(i => makeSession(i, `Sesi${i}`, 40, 700));
+// 8 sesi × ±30rb karakter → dengan maxChars default 150000 hasilnya multi-batch (±2 batch)
+const sessions = [1, 2, 3, 4, 5, 6, 7, 8].map(i => makeSession(i, `Sesi${i}`, 40, 700));
 
 (async () => {
   // 1. Alur normal: N panggilan ekstraksi + 1 panggilan final; jawaban dari LLM final
@@ -39,7 +39,7 @@ const sessions = [1, 2, 3, 4].map(i => makeSession(i, `Sesi${i}`, 40, 700));
     assert.ok(finalCalls[0].user.includes('Folder Uji'), 'nama folder di konteks final');
     assert.strictEqual(result.answer, 'JAWABAN FINAL dengan sitasi [Sesi1 — 00:10]');
     assert.strictEqual(result.batchFailed, 0);
-    assert.strictEqual(result.sessionsCovered, 4);
+    assert.strictEqual(result.sessionsCovered, 8);
     assert.ok(progressLog.some(([p]) => p === 100), 'progress mencapai 100');
     // Setiap batch (semua segmen) benar-benar terkirim ke LLM ekstraksi
     const sentText = extractCalls.map(c => c.user).join('\n');
@@ -94,7 +94,7 @@ const sessions = [1, 2, 3, 4].map(i => makeSession(i, `Sesi${i}`, 40, 700));
     assert.ok(calls.every(c => c.includes('asisten ekstraksi informasi')), 'tidak ada panggilan final/reduce');
   }
 
-  // 4. Semua batch gagal → throw (bukan jawaban kosong)
+  // 4. Semua batch gagal (jumlah batch kecil, di bawah ambang breaker) → throw jelas
   {
     const fakeLlm = async (messages) => {
       if (messages[0].content.includes('asisten ekstraksi informasi')) throw new Error('proxy mati');
@@ -102,8 +102,32 @@ const sessions = [1, 2, 3, 4].map(i => makeSession(i, `Sesi${i}`, 40, 700));
     };
     let threw = false;
     try { await askFolderQuestion(folder, sessions, 'Apa saja?', null, fakeLlm); }
-    catch (err) { threw = true; assert.ok(err.message.includes('Semua batch')); }
+    catch (err) { threw = true; assert.ok(err.message.includes('Semua batch'), `pesan: ${err.message}`); }
     assert.ok(threw, 'harus throw saat semua batch gagal');
+  }
+
+  // 5. CIRCUIT BREAKER: kegagalan sistemik (mis. kuota harian habis) pada folder besar
+  //    → berhenti cepat setelah ±4 batch gagal beruntun, TIDAK menggiling semua batch
+  {
+    const bigSessions = Array.from({ length: 60 }, (_, i) => makeSession(i + 1, `S${i + 1}`, 40, 700)); // ±12 batch
+    let attempts = 0;
+    const fakeLlm = async (messages) => {
+      if (messages[0].content.includes('asisten ekstraksi informasi')) {
+        attempts++;
+        throw new Error('503 All proxy tiers failed');
+      }
+      return 'X';
+    };
+    let threw = false;
+    try { await askFolderQuestion(folder, bigSessions, 'Apa saja?', null, fakeLlm); }
+    catch (err) {
+      threw = true;
+      assert.ok(err.message.includes('kuota'), `pesan breaker harus menyebut kuota: ${err.message}`);
+    }
+    assert.ok(threw, 'harus throw saat layanan kolaps');
+    // Tanpa breaker: 12 batch × 3 percobaan = 36. Dengan breaker (ambang 4, konkurensi 3,
+    // retry 3×): maksimal ±(4+2 in-flight)×3 = 18 — pastikan jauh di bawah 36.
+    assert.ok(attempts <= 24, `breaker tidak memutus: ${attempts} percobaan ekstraksi`);
   }
 
   console.log('✅ folder-ask-qa: semua tes lulus');

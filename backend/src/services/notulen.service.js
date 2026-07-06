@@ -933,7 +933,11 @@ ${session.summary ? `RINGKASAN:\n${session.summary}\n\n` : ''}TRANSKRIP:\n${tran
 // Mengemas transkrip SEMUA sesi dalam satu folder menjadi batch berukuran aman
 // untuk LLM. Invarian: setiap segmen masuk tepat satu batch — tidak ada yang
 // dibuang/terpotong (syarat utama fitur "tanya AI per folder").
-const ASK_BATCH_MAX_CHARS = 50000;
+// 150rb (bukan 50rb): kuota upstream hanya ~100 request/hari, jadi jumlah
+// panggilan per pertanyaan adalah kendala utama. Output ekstraksi tetap kecil
+// (ASK_EXTRACT_MAX_TOKENS) sehingga input besar tidak menabrak batas ~120 detik
+// generasi di tier utama proxy.
+const ASK_BATCH_MAX_CHARS = 150000;
 
 function fmtTanggalID(tanggal) {
   if (!tanggal) return '';
@@ -1001,10 +1005,15 @@ function buildAskBatches(sessionsWithSegments, maxChars = ASK_BATCH_MAX_CHARS) {
 // bersitasi. Batch yang tetap gagal TIDAK menghentikan job — jawaban parsial
 // diberi peringatan eksplisit (keputusan user, lihat spec 2026-07-06).
 const ASK_CONCURRENCY = 3;
-const ASK_EXTRACT_MAX_TOKENS = 2000;
+const ASK_EXTRACT_MAX_TOKENS = 3000;
 const ASK_FINAL_MAX_TOKENS = 8000;
 const ASK_REDUCE_GROUP_MAX_CHARS = 40000;
 const ASK_RETRY_BASE_MS = parseInt(process.env.ASK_RETRY_BASE_MS || '3000');
+// Circuit breaker: N batch gagal BERUNTUN = kegagalan sistemik (mis. kuota
+// harian upstream habis — proxy hanya membalas 503 generik, tidak bisa
+// dibedakan dari body). Hentikan job segera daripada menggiling sisa batch
+// yang pasti gagal (tiap kegagalan menelan ±60 detik retry internal proxy).
+const ASK_ABORT_AFTER_CONSEC_FAILS = 4;
 const NO_INFO_MARKER = 'TIDAK ADA INFORMASI RELEVAN';
 
 const ASK_EXTRACT_SYSTEM = `Kamu adalah asisten ekstraksi informasi. Kamu menerima potongan transkrip dari beberapa sesi rekaman dalam satu folder, plus satu pertanyaan. Tugasmu: kutip dan rangkum SEMUA informasi dari transkrip yang relevan dengan pertanyaan itu.
@@ -1058,18 +1067,30 @@ async function askFolderQuestion(folder, sessionsWithSegments, question, onProgr
 
   // MAP — ekstraksi per batch, paralel, retry per batch
   let doneCount = 0;
+  let consecFails = 0;
+  let aborted = false;
   const mapResults = await promisePool(batches, ASK_CONCURRENCY, async (batch) => {
+    if (aborted) throw new Error('Dibatalkan (circuit breaker)');
     try {
-      return await llmWithRetry(callLlm, [
+      const out = await llmWithRetry(callLlm, [
         { role: 'system', content: ASK_EXTRACT_SYSTEM },
         { role: 'user', content: `PERTANYAAN: ${question}\n\nTRANSKRIP:\n${batch.text}` },
       ], ASK_EXTRACT_MAX_TOKENS);
+      consecFails = 0;
+      return out;
+    } catch (err) {
+      consecFails++;
+      if (consecFails >= ASK_ABORT_AFTER_CONSEC_FAILS) aborted = true;
+      throw err;
     } finally {
       doneCount++;
       progress(5 + Math.round((doneCount / total) * 80), `Membaca transkrip batch ${doneCount}/${total}...`);
     }
   });
 
+  if (aborted) {
+    throw new Error('Layanan AI sedang tidak dapat diakses — kemungkinan kuota harian LLM habis. Coba lagi nanti.');
+  }
   const failed = mapResults.filter(r => r && r.__error).length;
   if (failed === total) throw new Error('Semua batch transkrip gagal diproses. Coba lagi.');
   if (failed > 0) console.warn(`[notulen] Folder ask: ${failed}/${total} batch gagal setelah retry`);

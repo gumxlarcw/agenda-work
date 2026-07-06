@@ -40,7 +40,10 @@ Fungsi baru `askFolderQuestion(folder, sessions, question, onProgress)`:
 1. **Load:** semua sesi folder (status `recording`/`completed`, urut `tanggal` lalu
    `created_at`) + seluruh segmen per sesi (`getSegments`).
 2. **Batching (murni programatik, tanpa LLM):**
-   - Konstanta `ASK_BATCH_MAX_CHARS = 50000`.
+   - Konstanta `ASK_BATCH_MAX_CHARS = 150000`. (As-built: dinaikkan dari 50000 setelah
+     uji skala nyata menyingkap kuota upstream ~100 request/hari — jumlah panggilan per
+     pertanyaan adalah kendala utama. Output ekstraksi tetap kecil sehingga input besar
+     aman terhadap batas ~120 detik generasi.)
    - Transkrip per sesi = header metadata (`=== SESI: {judul} — {tanggal} ===`) + baris
      `[MM:SS] teks` (pakai `segmentsToTranscript` yang sudah ada).
    - Sesi digabung berurutan ke dalam batch sampai mendekati batas; sesi yang lebih besar
@@ -49,9 +52,13 @@ Fungsi baru `askFolderQuestion(folder, sessions, question, onProgress)`:
 3. **Map (ekstraksi):** untuk tiap batch, satu panggilan LLM:
    - System prompt: ekstraktor informasi; kutip sumber `[Judul sesi — MM:SS]`; jika tidak
      ada info relevan jawab literal `TIDAK ADA INFORMASI RELEVAN`.
-   - `max_tokens` ±2000, `temperature` 0.2, header `X-Long-Request: 1`.
+   - `max_tokens` 3000 (as-built; kompensasi batch lebih besar), `temperature` 0.3
+     (mengikuti `llmCall` yang ada), header `X-Long-Request: 1`.
    - **Konkurensi 3** (pool sederhana). Retry per batch 2× dengan backoff (3s, 9s).
-   - Batch yang tetap gagal dicatat (indeks + rentang sesi) — tidak menghentikan job.
+   - Batch yang tetap gagal dicatat — tidak menghentikan job, KECUALI ≥4 batch gagal
+     beruntun (as-built: **circuit breaker** `ASK_ABORT_AFTER_CONSEC_FAILS = 4`) →
+     kegagalan sistemik (mis. kuota harian habis; proxy hanya membalas 503 generik) →
+     job dihentikan segera dengan pesan "kemungkinan kuota harian LLM habis".
    - Progress callback per batch selesai: `5% + (selesai/total) × 80%`,
      step `"Membaca transkrip batch {k}/{total}..."`.
 4. **Reduce (sintesis):**
