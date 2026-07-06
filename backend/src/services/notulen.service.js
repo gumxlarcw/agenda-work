@@ -1134,6 +1134,87 @@ async function askFolderQuestion(folder, sessionsWithSegments, question, onProgr
   };
 }
 
+// --- Folder Q&A: DB helpers ---
+
+async function getFolderOwned(folderId, userId) {
+  const [rows] = await pool.query(
+    'SELECT * FROM notulen_folders WHERE id = ? AND user_id = ?',
+    [folderId, userId]
+  );
+  return rows[0] || null;
+}
+
+async function getFolderSessionsWithSegments(folderId) {
+  const [sessions] = await pool.query(
+    `SELECT * FROM notulen_sessions
+     WHERE folder_id = ? AND status IN ('recording','completed')
+     ORDER BY tanggal ASC, created_at ASC, id ASC`,
+    [folderId]
+  );
+  const result = [];
+  for (const session of sessions) {
+    const segments = await getSegments(session.id);
+    result.push({ session, segments });
+  }
+  return result;
+}
+
+async function createFolderQA(folderId, userId, question) {
+  const [r] = await pool.query(
+    'INSERT INTO notulen_folder_qa (folder_id, user_id, question) VALUES (?, ?, ?)',
+    [folderId, userId, question]
+  );
+  return r.insertId;
+}
+
+async function finishFolderQA(qaId, { answer, sessionsCovered, batchFailed }) {
+  await pool.query(
+    `UPDATE notulen_folder_qa
+     SET answer = ?, status = 'done', sessions_covered = ?, batch_failed = ?, answered_at = NOW()
+     WHERE id = ?`,
+    [answer, sessionsCovered, batchFailed, qaId]
+  );
+}
+
+async function failFolderQA(qaId, message) {
+  await pool.query(
+    `UPDATE notulen_folder_qa SET status = 'error', error_message = ? WHERE id = ?`,
+    [String(message || 'Gagal').slice(0, 500), qaId]
+  );
+}
+
+// liveIds = qaId yang jobnya masih hidup di memori route. Baris 'processing'
+// di luar daftar itu adalah orphan (server restart di tengah job) → error.
+async function listFolderQA(folderId, userId, liveIds = []) {
+  if (liveIds.length > 0) {
+    await pool.query(
+      `UPDATE notulen_folder_qa SET status = 'error', error_message = 'Terputus (server restart)'
+       WHERE folder_id = ? AND status = 'processing' AND id NOT IN (${liveIds.map(() => '?').join(',')})`,
+      [folderId, ...liveIds]
+    );
+  } else {
+    await pool.query(
+      `UPDATE notulen_folder_qa SET status = 'error', error_message = 'Terputus (server restart)'
+       WHERE folder_id = ? AND status = 'processing'`,
+      [folderId]
+    );
+  }
+  const [rows] = await pool.query(
+    `SELECT * FROM notulen_folder_qa WHERE folder_id = ? AND user_id = ?
+     ORDER BY created_at DESC, id DESC LIMIT 50`,
+    [folderId, userId]
+  );
+  return rows;
+}
+
+async function deleteFolderQA(qaId, folderId, userId) {
+  const [r] = await pool.query(
+    'DELETE FROM notulen_folder_qa WHERE id = ? AND folder_id = ? AND user_id = ?',
+    [qaId, folderId, userId]
+  );
+  return r.affectedRows > 0;
+}
+
 // --- YouTube CC Import ---
 // Download subtitle/CC via yt-dlp, parse VTT, return segments array
 async function importYoutubeCC(url, jobId, onProgress) {
@@ -1422,6 +1503,13 @@ module.exports = {
   buildAskBatches,
   ASK_BATCH_MAX_CHARS,
   askFolderQuestion,
+  getFolderOwned,
+  getFolderSessionsWithSegments,
+  createFolderQA,
+  finishFolderQA,
+  failFolderQA,
+  listFolderQA,
+  deleteFolderQA,
   parseSRT,
   parseVTT,
   parseTranscriptText,

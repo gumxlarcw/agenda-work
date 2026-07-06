@@ -153,6 +153,112 @@ router.delete('/folders/:id', verifyToken, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// FOLDER Q&A — "Tanya AI" atas SEMUA transkrip dalam satu folder.
+// Map-reduce di notulenService.askFolderQuestion; progress via SSE
+// (pola sama dengan /:id/summary). Riwayat di tabel notulen_folder_qa
+// (migrations/2026-07-06_notulen_folder_qa.sql).
+// ═══════════════════════════════════════════════════════════════
+const folderAskProgress = new Map(); // qaId(string) → {percent, step, done?, error?, answer?}
+
+// POST ajukan pertanyaan — balas langsung {qaId}, job jalan di background
+router.post('/folders/:id/ask', verifyToken, async (req, res) => {
+  try {
+    const question = (req.body.question || '').trim();
+    if (!question) return res.status(400).json({ success: false, message: 'Pertanyaan diperlukan' });
+
+    const folder = await notulenService.getFolderOwned(req.params.id, req.user.id);
+    if (!folder) return res.status(404).json({ success: false, message: 'Folder tidak ditemukan' });
+
+    // Satu pertanyaan aktif per folder — listFolderQA sekaligus membersihkan orphan
+    const liveIds = [...folderAskProgress.keys()];
+    const existing = await notulenService.listFolderQA(folder.id, req.user.id, liveIds);
+    if (existing.some(r => r.status === 'processing')) {
+      return res.status(409).json({ success: false, message: 'Masih ada pertanyaan yang sedang diproses di folder ini' });
+    }
+
+    const sessions = await notulenService.getFolderSessionsWithSegments(folder.id);
+    const segCount = sessions.reduce((n, s) => n + s.segments.length, 0);
+    if (segCount === 0) return res.status(400).json({ success: false, message: 'Folder tidak memiliki transkrip' });
+
+    const qaId = await notulenService.createFolderQA(folder.id, req.user.id, question);
+    folderAskProgress.set(String(qaId), { percent: 0, step: 'Memulai...' });
+    res.json({ success: true, data: { qaId } });
+
+    // Background — hasil dikirim via SSE dan disimpan permanen di DB
+    notulenService.askFolderQuestion(folder, sessions, question, (percent, step) => {
+      folderAskProgress.set(String(qaId), { percent, step });
+    }).then(async ({ answer, sessionsCovered, batchFailed }) => {
+      await notulenService.finishFolderQA(qaId, { answer, sessionsCovered, batchFailed });
+      folderAskProgress.set(String(qaId), { percent: 100, step: 'Selesai', done: true, answer });
+    }).catch(async (err) => {
+      console.error('[notulen] Folder ask error:', err.message);
+      await notulenService.failFolderQA(qaId, err.message).catch(() => {});
+      folderAskProgress.set(String(qaId), { percent: 0, step: err.message, error: true, done: true });
+    }).finally(() => {
+      setTimeout(() => folderAskProgress.delete(String(qaId)), 15000);
+    });
+  } catch (err) {
+    console.error('[notulen] Folder ask error:', err.message);
+    res.status(500).json({ success: false, message: 'Gagal memulai pertanyaan' });
+  }
+});
+
+// SSE progress — token via query karena EventSource tidak bisa set header
+router.get('/folders/:id/ask/progress', (req, res, next) => {
+  if (req.query.token) req.headers.authorization = `Bearer ${req.query.token}`;
+  next();
+}, verifyToken, (req, res) => {
+  const key = String(req.query.qaId || '');
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const heartbeat = () => res.write(': heartbeat\n\n');
+  send({ percent: 0, step: 'Menunggu...' });
+  const pollInterval = setInterval(() => {
+    const prog = folderAskProgress.get(key);
+    if (prog) {
+      send(prog);
+      if (prog.done || prog.error) {
+        clearInterval(pollInterval);
+        clearInterval(hbInterval);
+        res.end();
+      }
+    }
+  }, 400);
+  const hbInterval = setInterval(heartbeat, 20000);
+  req.on('close', () => { clearInterval(pollInterval); clearInterval(hbInterval); });
+});
+
+// GET riwayat Q&A folder
+router.get('/folders/:id/qa', verifyToken, async (req, res) => {
+  try {
+    const folder = await notulenService.getFolderOwned(req.params.id, req.user.id);
+    if (!folder) return res.status(404).json({ success: false, message: 'Folder tidak ditemukan' });
+    const rows = await notulenService.listFolderQA(folder.id, req.user.id, [...folderAskProgress.keys()]);
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error('[notulen] Folder QA list error:', err.message);
+    res.status(500).json({ success: false, message: 'Gagal memuat riwayat' });
+  }
+});
+
+// DELETE satu entri riwayat
+router.delete('/folders/:id/qa/:qaId', verifyToken, async (req, res) => {
+  try {
+    const ok = await notulenService.deleteFolderQA(req.params.qaId, req.params.id, req.user.id);
+    if (!ok) return res.status(404).json({ success: false, message: 'Riwayat tidak ditemukan' });
+    res.json({ success: true, message: 'Riwayat dihapus' });
+  } catch (err) {
+    console.error('[notulen] Folder QA delete error:', err.message);
+    res.status(500).json({ success: false, message: 'Gagal menghapus riwayat' });
+  }
+});
+
 // Get session detail + segments
 router.get('/:id', verifyToken, async (req, res) => {
   try {
