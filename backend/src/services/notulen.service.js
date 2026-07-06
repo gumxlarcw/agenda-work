@@ -369,8 +369,12 @@ function mergeShortSegments(segments, minWords = 5) {
 
 // --- LLM Summary ---
 
-// ~60k chars ≈ 10k words ≈ 2 hours of meeting speech (60% active)
-const CHUNK_MAX_CHARS = 60000;
+// ~15k chars ≈ 2.5k words ≈ 30 min of meeting speech (60% active).
+// Lowered from 60k: a single full-meeting summary call generates for >120s and
+// trips the LLM proxy's upstream ceiling (both tiers 503/502). Smaller chunks
+// keep each generation well within budget — the parts are stitched together
+// programmatically by generateSummary(). See the X-Long-Request note in llmCall().
+const CHUNK_MAX_CHARS = 15000;
 const LLM_TIMEOUT = 600000; // 10 minutes per chunk
 
 function segmentsToTranscript(segments) {
@@ -418,7 +422,14 @@ async function llmCall(messages, maxTokens = 16000) {
     messages,
     temperature: 0.3,
     max_tokens: maxTokens,
-  }, { timeout: LLM_TIMEOUT });
+  }, {
+    timeout: LLM_TIMEOUT,
+    // Notulensi generation is a long, non-streaming "batched" call. Without this
+    // header the LLM proxy uses its snappy 12s budget (meant for chat) and the
+    // generation never finishes in time → cascades to a broken fallback → 503.
+    // X-Long-Request opts into the proxy's long budget (180s primary / 240s CLI).
+    headers: { 'X-Long-Request': '1' },
+  });
   return resp.data.choices[0].message.content;
 }
 
@@ -547,25 +558,9 @@ ATURAN PENULISAN:
   return llmCall([{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: userPrompt }], 16000);
 }
 
-async function combineSummaries(session, chunkSummaries) {
-  const combined = chunkSummaries.map((s, i) => `## Bagian ${i + 1}\n${s}`).join('\n\n---\n\n');
-  const userPrompt = `Gabungkan notulensi per bagian berikut dari acara "${session.judul}" (${session.tanggal}) menjadi SATU notulensi final yang lengkap, kohesif, dan terstruktur.
-
-NOTULENSI PER BAGIAN:
-${combined}
-
-INSTRUKSI PENGGABUNGAN:
-1. Pertahankan jenis konten yang terdeteksi (sosialisasi, training, rapat, dll) — JANGAN ubah ke format rapat jika kontennya bukan rapat
-2. Gabungkan bagian-bagian dengan urutan kronologis yang benar
-3. Satukan bagian yang sama (misal: semua Sesi Tanya Jawab digabung jadi satu seksi T&J, bukan dipisah per bagian)
-4. JANGAN hilangkan detail — jika ada informasi di salah satu bagian, pertahankan
-5. Hanya hilangkan kalimat yang BENAR-BENAR identik (kata per kata sama)
-6. Tindak lanjut/action items dari semua bagian dikumpulkan dalam satu tabel di akhir
-7. Gunakan format Markdown yang bersih dan konsisten
-8. Hasil akhir harus bisa dibaca sebagai dokumen notulensi resmi yang utuh`;
-
-  return llmCall([{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: userPrompt }]);
-}
+// (Removed combineSummaries() — the multi-part merge is now done programmatically
+//  in generateSummary() to keep every LLM call within the proxy's fast/clean
+//  primary-tier budget. See the X-Long-Request note in llmCall().)
 
 // Main entry point — supports progress callback for long meetings
 async function generateSummary(session, segments, onProgress) {
@@ -612,8 +607,18 @@ async function generateSummary(session, segments, onProgress) {
       prevSummary = s;     // next chunk will receive this as context
     }
 
-    progress(85, 'Menggabungkan semua bagian...');
-    const final = await combineSummaries(session, chunkSummaries);
+    // Programmatic merge — NOT a final LLM "combine" call. Each chunk summary
+    // already uses rolling context (prevSummary) so it doesn't repeat earlier
+    // points. Stitching them here avoids one large generation that would exceed
+    // the LLM proxy's ~120s primary-tier ceiling and spill to the slower,
+    // "talkative" fallback tier (preamble + insight noise). See llmCall().
+    progress(95, 'Menggabungkan semua bagian...');
+    const final = chunkSummaries.map((s, i) => {
+      const segs = chunks[i];
+      const start = fmtTime(segs[0].timestamp_seconds);
+      const end = fmtTime(segs[segs.length - 1].timestamp_seconds);
+      return `## Bagian ${i + 1} (${start}–${end})\n\n${(s || '').trim()}`;
+    }).join('\n\n---\n\n');
     progress(100, 'Selesai');
     return final;
   } catch (err) {
@@ -910,13 +915,84 @@ ${session.summary ? `RINGKASAN:\n${session.summary}\n\n` : ''}TRANSKRIP:\n${tran
       ],
       temperature: 0.3,
       max_tokens: 4096,
-    }, { timeout: 120000 });
+    }, {
+      timeout: 120000,
+      // Q&A runs over a full transcript — opt into the proxy's long budget so the
+      // answer isn't cut off by the default 12s (chat) timeout. See llmCall().
+      headers: { 'X-Long-Request': '1' },
+    });
 
     return resp.data.choices[0].message.content;
   } catch (err) {
     console.error(`[notulen] Ask error: ${err.message}`);
     return `Gagal menjawab: ${err.message}`;
   }
+}
+
+// --- Folder Q&A: batching ---
+// Mengemas transkrip SEMUA sesi dalam satu folder menjadi batch berukuran aman
+// untuk LLM. Invarian: setiap segmen masuk tepat satu batch — tidak ada yang
+// dibuang/terpotong (syarat utama fitur "tanya AI per folder").
+const ASK_BATCH_MAX_CHARS = 50000;
+
+function fmtTanggalID(tanggal) {
+  if (!tanggal) return '';
+  if (tanggal instanceof Date) return tanggal.toISOString().slice(0, 10);
+  return String(tanggal).slice(0, 10);
+}
+
+function buildAskBatches(sessionsWithSegments, maxChars = ASK_BATCH_MAX_CHARS) {
+  // 1. Bentuk "unit": sesi kecil utuh, sesi besar dipecah jadi (bagian n/m).
+  //    Satu unit tidak pernah dipecah lagi saat packing.
+  const units = [];
+  for (const { session, segments } of sessionsWithSegments) {
+    if (!segments || segments.length === 0) continue;
+    const lines = segments.map(s => {
+      const mm = Math.floor(s.timestamp_seconds / 60).toString().padStart(2, '0');
+      const ss = Math.floor(s.timestamp_seconds % 60).toString().padStart(2, '0');
+      return `[${mm}:${ss}] ${s.text}`;
+    });
+    const headerFor = (part, total) =>
+      `=== SESI: ${session.judul} — ${fmtTanggalID(session.tanggal)}${total > 1 ? ` (bagian ${part}/${total})` : ''} ===`;
+    const budget = maxChars - headerFor(99, 99).length - 2;
+
+    const parts = [];
+    let cur = [], curLen = 0;
+    for (const line of lines) {
+      if (curLen + line.length + 1 > budget && cur.length > 0) {
+        parts.push(cur);
+        cur = [];
+        curLen = 0;
+      }
+      cur.push(line);
+      curLen += line.length + 1;
+    }
+    if (cur.length > 0) parts.push(cur);
+
+    parts.forEach((partLines, i) => {
+      units.push({
+        sessionId: session.id,
+        text: `${headerFor(i + 1, parts.length)}\n${partLines.join('\n')}`,
+      });
+    });
+  }
+
+  // 2. Packing: gabungkan unit utuh berurutan ke dalam batch ≤ maxChars.
+  const batches = [];
+  let bTexts = [], bLen = 0, bIds = [];
+  const flush = () => {
+    if (bTexts.length === 0) return;
+    batches.push({ text: bTexts.join('\n\n'), sessionIds: [...new Set(bIds)] });
+    bTexts = []; bLen = 0; bIds = [];
+  };
+  for (const u of units) {
+    if (bLen + u.text.length + 2 > maxChars && bTexts.length > 0) flush();
+    bTexts.push(u.text);
+    bLen += u.text.length + 2;
+    bIds.push(u.sessionId);
+  }
+  flush();
+  return batches;
 }
 
 // --- YouTube CC Import ---
@@ -1204,6 +1280,8 @@ module.exports = {
   generateShareToken,
   revokeShareToken,
   askQuestion,
+  buildAskBatches,
+  ASK_BATCH_MAX_CHARS,
   parseSRT,
   parseVTT,
   parseTranscriptText,
