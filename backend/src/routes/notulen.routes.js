@@ -208,8 +208,21 @@ router.post('/folders/:id/ask', verifyToken, async (req, res) => {
 router.get('/folders/:id/ask/progress', (req, res, next) => {
   if (req.query.token) req.headers.authorization = `Bearer ${req.query.token}`;
   next();
-}, verifyToken, (req, res) => {
+}, verifyToken, async (req, res) => {
   const key = String(req.query.qaId || '');
+  // Anti-IDOR: stream berisi jawaban — pastikan folder milik user DAN qaId milik folder ini
+  try {
+    const folder = await notulenService.getFolderOwned(req.params.id, req.user.id);
+    if (!folder) return res.status(404).json({ success: false, message: 'Folder tidak ditemukan' });
+    const [qaRows] = await pool.query(
+      'SELECT id FROM notulen_folder_qa WHERE id = ? AND folder_id = ? AND user_id = ?',
+      [key || 0, folder.id, req.user.id]
+    );
+    if (qaRows.length === 0) return res.status(404).json({ success: false, message: 'Riwayat tidak ditemukan' });
+  } catch (err) {
+    console.error('[notulen] Folder ask progress error:', err.message);
+    return res.status(500).json({ success: false, message: 'Gagal membuka progress' });
+  }
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
