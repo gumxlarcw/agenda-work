@@ -995,6 +995,145 @@ function buildAskBatches(sessionsWithSegments, maxChars = ASK_BATCH_MAX_CHARS) {
   return batches;
 }
 
+// --- Folder Q&A: map-reduce atas SEMUA transkrip dalam satu folder ---
+// Map: tiap batch → panggilan ekstraksi (paralel ASK_CONCURRENCY, retry 3×).
+// Reduce: hasil ekstraksi digabung (bertingkat bila perlu) → satu jawaban
+// bersitasi. Batch yang tetap gagal TIDAK menghentikan job — jawaban parsial
+// diberi peringatan eksplisit (keputusan user, lihat spec 2026-07-06).
+const ASK_CONCURRENCY = 3;
+const ASK_EXTRACT_MAX_TOKENS = 2000;
+const ASK_FINAL_MAX_TOKENS = 8000;
+const ASK_REDUCE_GROUP_MAX_CHARS = 40000;
+const ASK_RETRY_BASE_MS = parseInt(process.env.ASK_RETRY_BASE_MS || '3000');
+const NO_INFO_MARKER = 'TIDAK ADA INFORMASI RELEVAN';
+
+const ASK_EXTRACT_SYSTEM = `Kamu adalah asisten ekstraksi informasi. Kamu menerima potongan transkrip dari beberapa sesi rekaman dalam satu folder, plus satu pertanyaan. Tugasmu: kutip dan rangkum SEMUA informasi dari transkrip yang relevan dengan pertanyaan itu.
+Aturan:
+- Sebutkan sumber setiap informasi dalam format [Judul sesi — MM:SS].
+- Jangan menjawab pertanyaannya — hanya kumpulkan bahan mentah yang relevan.
+- Jangan mengarang; hanya dari transkrip yang diberikan.
+- Jika TIDAK ADA informasi yang relevan sama sekali, balas persis: ${NO_INFO_MARKER}`;
+
+const ASK_MERGE_SYSTEM = `Kamu adalah asisten yang menggabungkan beberapa kumpulan catatan hasil ekstraksi transkrip. Gabungkan TANPA menghilangkan informasi apa pun, pertahankan semua sitasi [Judul sesi — MM:SS], hilangkan hanya duplikat persis.`;
+
+const ASK_FINAL_SYSTEM = `Kamu adalah asisten yang menjawab pertanyaan berdasarkan kumpulan catatan hasil ekstraksi dari transkrip SEMUA sesi dalam satu folder. Jawab lengkap dan terstruktur dalam Bahasa Indonesia, format Markdown, sertakan sitasi [Judul sesi — MM:SS] pada poin-poin penting. Jika catatan tidak memuat jawabannya, katakan dengan jujur. Di akhir jawaban, sebutkan sesi mana saja yang menjadi sumber jawaban.`;
+
+async function llmWithRetry(llm, messages, maxTokens, tries = 3) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await llm(messages, maxTokens);
+    } catch (err) {
+      lastErr = err;
+      if (i < tries - 1) await new Promise(r => setTimeout(r, ASK_RETRY_BASE_MS * Math.pow(3, i)));
+    }
+  }
+  throw lastErr;
+}
+
+// Pool sederhana: jalankan worker(item) maksimal `limit` bersamaan.
+// Worker yang melempar error menghasilkan { __error } di posisi itu (urutan terjaga).
+async function promisePool(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function run() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await worker(items[i], i).catch(err => ({ __error: err }));
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
+  return results;
+}
+
+async function askFolderQuestion(folder, sessionsWithSegments, question, onProgress, llm = null) {
+  const progress = onProgress || (() => {});
+  const callLlm = llm || ((messages, maxTokens) => llmCall(messages, maxTokens));
+
+  progress(2, 'Menyiapkan transkrip...');
+  const batches = buildAskBatches(sessionsWithSegments);
+  const total = batches.length;
+  if (total === 0) throw new Error('Folder tidak memiliki transkrip.');
+  console.log(`[notulen] Folder ask: folder=${folder.id} sessions=${sessionsWithSegments.length} batches=${total}`);
+
+  // MAP — ekstraksi per batch, paralel, retry per batch
+  let doneCount = 0;
+  const mapResults = await promisePool(batches, ASK_CONCURRENCY, async (batch) => {
+    try {
+      return await llmWithRetry(callLlm, [
+        { role: 'system', content: ASK_EXTRACT_SYSTEM },
+        { role: 'user', content: `PERTANYAAN: ${question}\n\nTRANSKRIP:\n${batch.text}` },
+      ], ASK_EXTRACT_MAX_TOKENS);
+    } finally {
+      doneCount++;
+      progress(5 + Math.round((doneCount / total) * 80), `Membaca transkrip batch ${doneCount}/${total}...`);
+    }
+  });
+
+  const failed = mapResults.filter(r => r && r.__error).length;
+  if (failed === total) throw new Error('Semua batch transkrip gagal diproses. Coba lagi.');
+  if (failed > 0) console.warn(`[notulen] Folder ask: ${failed}/${total} batch gagal setelah retry`);
+
+  const relevant = mapResults
+    .filter(r => typeof r === 'string')
+    .map(r => r.trim())
+    .filter(r => r && !r.toUpperCase().includes(NO_INFO_MARKER));
+
+  let answer;
+  if (relevant.length === 0) {
+    answer = `Tidak ditemukan informasi yang relevan dengan pertanyaan ini di transkrip folder "${folder.name}" (${sessionsWithSegments.length} sesi diperiksa).`;
+  } else {
+    // REDUCE — gabung bertingkat bila materi ekstraksi terlalu besar untuk satu panggilan
+    progress(86, 'Menyusun jawaban...');
+    let material = relevant;
+    while (material.join('\n\n---\n\n').length > ASK_REDUCE_GROUP_MAX_CHARS && material.length > 1) {
+      const groups = [];
+      let cur = [], curLen = 0;
+      for (const m of material) {
+        if (curLen + m.length > ASK_REDUCE_GROUP_MAX_CHARS && cur.length > 0) {
+          groups.push(cur); cur = []; curLen = 0;
+        }
+        cur.push(m); curLen += m.length;
+      }
+      if (cur.length > 0) groups.push(cur);
+      progress(88, `Menggabungkan catatan (${groups.length} kelompok)...`);
+      const merged = await promisePool(groups, ASK_CONCURRENCY, (group) =>
+        llmWithRetry(callLlm, [
+          { role: 'system', content: ASK_MERGE_SYSTEM },
+          { role: 'user', content: `PERTANYAAN (untuk konteks relevansi): ${question}\n\nCATATAN:\n${group.join('\n\n---\n\n')}` },
+        ], ASK_EXTRACT_MAX_TOKENS));
+      // Kegagalan merge = kehilangan materi ekstraksi → JANGAN dibuang diam-diam
+      // (janji coverage). llmWithRetry sudah retry 3× — kalau tetap gagal, gagalkan job.
+      if (merged.some(r => r && r.__error)) throw new Error('Gagal menggabungkan catatan ekstraksi. Coba lagi.');
+      material = merged.map(r => String(r).trim()).filter(Boolean);
+      if (material.length === 0) throw new Error('Gagal menggabungkan catatan ekstraksi. Coba lagi.');
+    }
+
+    progress(92, 'Menyusun jawaban akhir...');
+    const headerInfo = `INFORMASI FOLDER:
+- Nama folder: ${folder.name}
+- Jumlah sesi: ${sessionsWithSegments.length}
+- Daftar sesi: ${sessionsWithSegments.map(s => `${s.session.judul} (${fmtTanggalID(s.session.tanggal)})`).join('; ')}`;
+    answer = await llmWithRetry(callLlm, [
+      { role: 'system', content: ASK_FINAL_SYSTEM },
+      { role: 'user', content: `${headerInfo}\n\nCATATAN HASIL EKSTRAKSI:\n${material.join('\n\n---\n\n')}\n\nPERTANYAAN: ${question}` },
+    ], ASK_FINAL_MAX_TOKENS);
+  }
+
+  // Peringatan parsial ditambahkan PROGRAMATIK (bukan oleh LLM) — sesuai spec
+  if (failed > 0) {
+    answer = `⚠️ ${failed} dari ${total} bagian transkrip gagal dibaca — jawaban mungkin tidak lengkap.\n\n${answer}`;
+  }
+
+  progress(100, 'Selesai');
+  return {
+    answer,
+    batchTotal: total,
+    batchFailed: failed,
+    sessionsCovered: sessionsWithSegments.length,
+  };
+}
+
 // --- YouTube CC Import ---
 // Download subtitle/CC via yt-dlp, parse VTT, return segments array
 async function importYoutubeCC(url, jobId, onProgress) {
@@ -1282,6 +1421,7 @@ module.exports = {
   askQuestion,
   buildAskBatches,
   ASK_BATCH_MAX_CHARS,
+  askFolderQuestion,
   parseSRT,
   parseVTT,
   parseTranscriptText,
