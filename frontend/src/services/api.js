@@ -368,6 +368,14 @@ export const notulenFoldersAPI = {
   create: (data) => api.post('/notulen/folders', data),
   update: (id, data) => api.put(`/notulen/folders/${id}`, data),
   delete: (id) => api.delete(`/notulen/folders/${id}`),
+  ask: (id, question) => api.post(`/notulen/folders/${id}/ask`, { question }),
+  askProgressUrl: (id, qaId) => {
+    const token = localStorage.getItem('accessToken');
+    const base = import.meta.env.PROD ? 'https://api-agenda.bpsmalut.com/api' : '/api';
+    return `${base}/notulen/folders/${id}/ask/progress?qaId=${qaId}&token=${encodeURIComponent(token)}`;
+  },
+  listQA: (id) => api.get(`/notulen/folders/${id}/qa`),
+  deleteQA: (id, qaId) => api.delete(`/notulen/folders/${id}/qa/${qaId}`),
 };
 
 export function getNotulenWsUrl() {
