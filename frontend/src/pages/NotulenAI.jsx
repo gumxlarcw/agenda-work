@@ -233,6 +233,198 @@ function FolderTile({ folder, isOpen, onToggleMenu, onCloseMenu, onOpen, onRenam
   );
 }
 
+// Modal "Tanya AI folder" — bertanya atas SEMUA transkrip di satu folder.
+// Backend membaca seluruh transkrip bertahap (map-reduce, beberapa menit);
+// progress via SSE, riwayat permanen di DB (tabel notulen_folder_qa) sehingga
+// aman ditutup/refresh — jawaban tetap muncul di riwayat saat selesai.
+function FolderAskModal({ folder, onClose }) {
+  const [history, setHistory] = useState([]);
+  const [loadingHistory, setLoadingHistory] = useState(true);
+  const [question, setQuestion] = useState('');
+  const [processing, setProcessing] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [progressStep, setProgressStep] = useState('');
+  const esRef = useRef(null);
+  const bottomRef = useRef(null);
+  // Ref pemutus siklus dependensi attachProgress ↔ loadHistory
+  const loadHistoryRef = useRef(() => {});
+
+  const attachProgress = useCallback((qaId) => {
+    setProcessing(true);
+    setProgress(0);
+    setProgressStep('Memulai...');
+    esRef.current?.close();
+    const es = new EventSource(notulenFoldersAPI.askProgressUrl(folder.id, qaId));
+    esRef.current = es;
+    es.onmessage = (e) => {
+      try {
+        const d = JSON.parse(e.data);
+        setProgress(d.percent || 0);
+        setProgressStep(d.step || '');
+        if (d.done) {
+          es.close();
+          setProcessing(false);
+          if (d.error) toast.error('Gagal menjawab: ' + (d.step || ''));
+          loadHistoryRef.current();
+        }
+      } catch {}
+    };
+    // Jangan matikan processing di onerror — EventSource auto-reconnect,
+    // dan hasil tetap aman di DB meski koneksi progress putus.
+    es.onerror = () => {};
+  }, [folder.id]);
+
+  const loadHistory = useCallback(async () => {
+    try {
+      const res = await notulenFoldersAPI.listQA(folder.id);
+      const rows = res.data.data || [];
+      setHistory(rows);
+      // Resume: pertanyaan yang masih diproses (mis. setelah refresh) → sambung SSE lagi
+      const active = rows.find(r => r.status === 'processing');
+      if (active) attachProgress(active.id);
+    } catch {
+      toast.error('Gagal memuat riwayat');
+    } finally {
+      setLoadingHistory(false);
+    }
+  }, [folder.id, attachProgress]);
+  loadHistoryRef.current = loadHistory;
+
+  useEffect(() => {
+    loadHistory();
+    return () => esRef.current?.close();
+  }, [loadHistory]);
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [history, processing]);
+
+  async function handleAsk() {
+    const q = question.trim();
+    if (!q || processing) return;
+    setQuestion('');
+    try {
+      const res = await notulenFoldersAPI.ask(folder.id, q);
+      const qaId = res.data.data.qaId;
+      setHistory(prev => [{ id: qaId, question: q, answer: null, status: 'processing', created_at: new Date().toISOString() }, ...prev]);
+      attachProgress(qaId);
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Gagal mengirim pertanyaan');
+      setQuestion(q);
+    }
+  }
+
+  async function handleDelete(qaId) {
+    if (!window.confirm('Hapus tanya-jawab ini?')) return;
+    try {
+      await notulenFoldersAPI.deleteQA(folder.id, qaId);
+      setHistory(prev => prev.filter(r => r.id !== qaId));
+    } catch {
+      toast.error('Gagal menghapus');
+    }
+  }
+
+  // history dari API terbaru-dulu; tampilkan kronologis (terlama di atas) ala chat
+  const ordered = [...history].reverse();
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm px-4 animate-fadeIn" onClick={onClose}>
+      <div className="bg-white rounded-2xl max-w-2xl w-full h-[85vh] shadow-xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        {/* Header */}
+        <div className="px-5 py-4 border-b border-gray-100 flex items-start gap-3">
+          <HiOutlineChatAlt2 className="w-6 h-6 text-primary-500 shrink-0 mt-0.5" />
+          <div className="min-w-0 flex-1">
+            <h3 className="text-base font-bold text-gray-900 truncate">Tanya AI — {folder.name}</h3>
+            <p className="text-xs text-gray-400 mt-0.5">
+              AI membaca SEMUA transkrip di folder ini ({folder.session_count || 0} sesi) — satu jawaban butuh beberapa menit. Riwayat tersimpan; boleh ditutup saat menunggu.
+            </p>
+          </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-400" title="Tutup">
+            <HiOutlineX className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Riwayat */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          {loadingHistory ? (
+            <div className="text-center text-gray-400 text-sm mt-8 animate-pulse">Memuat riwayat...</div>
+          ) : ordered.length === 0 ? (
+            <div className="text-center text-gray-400 text-xs mt-8">
+              <p>Belum ada pertanyaan untuk folder ini.</p>
+              <p className="mt-1">Contoh: "Apa saja keputusan penting dari semua sesi?"</p>
+            </div>
+          ) : (
+            ordered.map(item => (
+              <div key={item.id} className="space-y-2">
+                <div className="flex justify-end items-start gap-2 group">
+                  <button
+                    onClick={() => handleDelete(item.id)}
+                    className="opacity-0 group-hover:opacity-100 p-1 text-gray-300 hover:text-red-500 transition-all"
+                    title="Hapus tanya-jawab ini"
+                  >
+                    <HiOutlineTrash className="w-4 h-4" />
+                  </button>
+                  <div className="max-w-[85%] px-3 py-2 rounded-xl rounded-br-sm text-sm bg-primary-600 text-white leading-relaxed">
+                    {item.question}
+                  </div>
+                </div>
+                <div className="flex justify-start">
+                  {item.status === 'processing' ? (
+                    <div className="bg-gray-100 text-gray-400 px-3 py-2 rounded-xl rounded-bl-sm text-sm animate-pulse">Sedang membaca transkrip...</div>
+                  ) : item.status === 'error' ? (
+                    <div className="bg-red-50 text-red-600 px-3 py-2 rounded-xl rounded-bl-sm text-xs">
+                      Gagal: {item.error_message || 'kesalahan tidak diketahui'}
+                    </div>
+                  ) : (
+                    <div
+                      className="max-w-[92%] px-4 py-3 rounded-xl rounded-bl-sm text-sm bg-gray-100 text-gray-700 leading-relaxed overflow-x-auto"
+                      dangerouslySetInnerHTML={{ __html: renderMarkdown(item.answer || '') }}
+                    />
+                  )}
+                </div>
+              </div>
+            ))
+          )}
+          <div ref={bottomRef} />
+        </div>
+
+        {/* Progress saat memproses */}
+        {processing && (
+          <div className="px-5 py-3 border-t border-gray-100 bg-primary-50/50">
+            <div className="flex items-center justify-between text-xs text-gray-600 mb-1.5">
+              <span className="truncate">{progressStep || 'Memproses...'}</span>
+              <span className="font-semibold shrink-0 ml-2">{progress}%</span>
+            </div>
+            <div className="h-1.5 bg-gray-200 rounded-full overflow-hidden">
+              <div className="h-full bg-primary-500 rounded-full transition-all duration-500" style={{ width: `${progress}%` }} />
+            </div>
+          </div>
+        )}
+
+        {/* Input */}
+        <div className="p-3 border-t border-gray-100">
+          <div className="flex gap-2">
+            <input
+              value={question}
+              onChange={e => setQuestion(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleAsk(); } }}
+              placeholder={processing ? 'Tunggu jawaban selesai...' : 'Tanya tentang semua transkrip di folder ini...'}
+              className="flex-1 px-3 py-2 border border-gray-200 rounded-xl text-sm focus:ring-2 focus:ring-primary-500/30 focus:border-primary-400 outline-none"
+              disabled={processing}
+            />
+            <button
+              onClick={handleAsk}
+              disabled={processing || !question.trim()}
+              className="px-3 py-2 bg-primary-600 hover:bg-primary-700 disabled:bg-gray-300 text-white rounded-xl transition-all"
+              title="Kirim pertanyaan"
+            >
+              {processing ? <HiOutlineRefresh className="w-4 h-4 animate-spin" /> : <HiOutlineArrowRight className="w-4 h-4" />}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function EditModal({ session, folders = [], onClose, onSaved }) {
   const [judul, setJudul] = useState(session.judul || '');
   const [subJudul, setSubJudul] = useState(session.sub_judul || '');
@@ -346,6 +538,7 @@ export default function NotulenAI() {
   const [unfiledCount, setUnfiledCount] = useState(0);
   const [folderFilter, setFolderFilter] = useState(null);
   const [openFolderMenuId, setOpenFolderMenuId] = useState(null);
+  const [showFolderAsk, setShowFolderAsk] = useState(false);
 
   const loadFolders = useCallback(async () => {
     try {
@@ -642,6 +835,15 @@ export default function NotulenAI() {
             <HiOutlineFolderOpen className="w-4 h-4 text-primary-500" />
             {folders.find(f => f.id === folderFilter)?.name || 'Folder'}
           </span>
+          {typeof folderFilter === 'number' && (
+            <button
+              onClick={() => setShowFolderAsk(true)}
+              className="ml-auto inline-flex items-center gap-1.5 px-3 py-1.5 bg-primary-600 hover:bg-primary-700 text-white rounded-xl text-xs font-medium transition-all"
+              title="Tanya AI tentang semua transkrip di folder ini"
+            >
+              <HiOutlineChatAlt2 className="w-4 h-4" /> Tanya AI
+            </button>
+          )}
         </div>
       )}
 
@@ -795,6 +997,14 @@ export default function NotulenAI() {
           folders={folders}
           onClose={() => setEditSession(null)}
           onSaved={() => { setEditSession(null); loadSessions(page); loadFolders(); }}
+        />
+      )}
+
+      {/* Tanya AI folder — bertanya atas semua transkrip di folder yang sedang dibuka */}
+      {showFolderAsk && typeof folderFilter === 'number' && (
+        <FolderAskModal
+          folder={folders.find(f => f.id === folderFilter) || { id: folderFilter, name: 'Folder' }}
+          onClose={() => setShowFolderAsk(false)}
         />
       )}
 
@@ -1489,12 +1699,16 @@ function RecordingView({ onBack, user, resumeSession }) {
   const reconnectAttemptsRef = useRef(0);
   const isRecordingRef = useRef(false);
   const sessionMetaRef = useRef(null);
+  const sessionIdRef = useRef(resumeSession?.id || null);
   const visibilityHandlerRef = useRef(null);
   const offlineChunkBuffer = useRef([]);
   const segmentBatchRef = useRef([]);
   const batchTimerRef = useRef(null);
 
   useEffect(() => { isPausedRef.current = isPaused; }, [isPaused]);
+  // Mirror sessionId into a ref so the long-lived WS reconnect closure always
+  // sees the current session id (state would be stale inside the closure).
+  useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
 
   useEffect(() => {
     const goOnline = () => setIsOnline(true);
@@ -1553,7 +1767,16 @@ function RecordingView({ onBack, user, resumeSession }) {
       setWsConnected(true);
       reconnectAttemptsRef.current = 0;
       if (isReconnect && sessionMetaRef.current) {
-        ws.send(JSON.stringify({ command: 'resume' }));
+        // Re-attach to the existing DB session. A reconnected WS is a NEW backend
+        // connection with NO in-memory sessionState, so the old `resume` command
+        // was a no-op and the backend silently dropped ALL audio after a blip.
+        // resume_session rebuilds state from the DB and continues timestamps from
+        // the last saved segment. Fall back to `start` only if we have no id yet.
+        if (sessionIdRef.current) {
+          ws.send(JSON.stringify({ command: 'resume_session', sessionId: sessionIdRef.current }));
+        } else {
+          ws.send(JSON.stringify({ command: 'start', ...sessionMetaRef.current }));
+        }
         toast.success('Koneksi tersambung kembali', { id: 'ws-reconnect' });
       } else if (resumeSession?.id) {
         // Attach to existing completed session instead of creating a new one
