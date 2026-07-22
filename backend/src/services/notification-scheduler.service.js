@@ -22,7 +22,11 @@ const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
 dayjs.extend(utc);
 
-const LLM_PROXY_URL = process.env.LLM_PROXY_URL || 'http://localhost:3031';
+// This file appends `/v1/chat/completions`, so the base must NOT end in /v1 —
+// but notulen.service.js expects the same env WITH /v1. Normalize so either
+// form of LLM_PROXY_URL works (a trailing /v1 in .env used to produce
+// /v1/v1/chat/completions → 404 on every morning digest).
+const LLM_PROXY_URL = (process.env.LLM_PROXY_URL || 'http://localhost:3031').replace(/\/v1\/?$/, '');
 // #27: the previous default 'gemini-3-flash-preview' is not a valid model name on any
 // known provider and was the likely root cause of hourly 404s. Default to the model
 // documented in ../../../MEMORY.md; override with LLM_DIGEST_MODEL env var.

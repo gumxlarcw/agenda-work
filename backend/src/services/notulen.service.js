@@ -144,7 +144,10 @@ function spawnYtdlpWithProgress(args, onProgress, downloadRange = [0, 100], conv
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'whisper-large-v3-turbo';
 const GROQ_URL = 'https://api.groq.com/openai/v1/audio/transcriptions';
-const LLM_PROXY_URL = process.env.LLM_PROXY_URL || 'http://localhost:3031/v1';
+// This file appends `/chat/completions`, so the base MUST end in /v1 — but
+// notification-scheduler.service.js expects the same env WITHOUT /v1.
+// Normalize so either form of LLM_PROXY_URL works.
+const LLM_PROXY_URL = (process.env.LLM_PROXY_URL || 'http://localhost:3031/v1').replace(/\/v1\/?$/, '') + '/v1';
 const LLM_MODEL = process.env.LLM_MODEL || 'claude-sonnet-4-6';
 
 const SAMPLE_RATE = 16000;

@@ -66,8 +66,10 @@ const whatsappService = {
 
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
+        // wa-service (:4001) expects a whatsapp-web.js chat id, not a bare
+        // number — `{number: …}` gets 400 "chatId dan message wajib diisi".
         const response = await axios.post(`${OPENCLAW_API_URL}/send`, {
-          number: normalizedNumber,
+          chatId: `${normalizedNumber}@c.us`,
           message: message,
           account: account
         }, {
